@@ -13,13 +13,16 @@ import argparse
 import nltk
 import os
 import pickle
-from utils import symbol_filter, re_lemma, fully_part_header, group_header, partial_header, num2year, group_symbol, group_values, group_digital
-from utils import AGG, wordnet_lemmatizer
-from utils import load_dataSets
+from preprocess.utils import symbol_filter, re_lemma, fully_part_header, group_header, partial_header, num2year, group_symbol, group_values, group_digital
+from preprocess.utils import AGG, wordnet_lemmatizer
+from preprocess.utils import load_dataSets
+
 
 def process_datas(datas, args):
     """
-
+    Ursin: what we do here is basically filling the "question_arg" and "question_arg_type" field of each data-row.
+    The question_arg_type contains information if a word in the question refers to a column, a table or a value.
+    This reflects the chaper 2.2 in the IRNet-paper.
     :param datas:
     :param args:
     :return:

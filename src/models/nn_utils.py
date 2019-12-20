@@ -1,13 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
-
-# -*- coding: utf-8 -*-
-"""
-# @Time    : 2019/5/25
-# @Author  : Jiaqi&Zecheng
-# @File    : utils.py
-# @Software: PyCharm
-"""
 import torch.nn.functional as F
 import torch.nn.init as init
 import numpy as np
@@ -17,6 +7,12 @@ from six.moves import xrange
 
 def dot_prod_attention(h_t, src_encoding, src_encoding_att_linear, mask=None):
     """
+    Ursin: in my understanding this method is nothing more than a typical attention mechanism: do a matrix multiplication
+    with the encodings (src_encoding_att_linear) and the current cell state (h_t) to calculate the attention score.
+    Do then take the attention scores into a softmax to get the weights. With this weights we multiply the original
+    source embeddings (src_encoding) and create a context vector (ctx_vec) which is is a composite of all source embeddings,
+    weighted with attention.
+
     :param h_t: (batch_size, hidden_size)
     :param src_encoding: (batch_size, src_sent_len, hidden_size * 2)
     :param src_encoding_att_linear: (batch_size, src_sent_len, hidden_size)

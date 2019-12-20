@@ -54,18 +54,26 @@ class BasicModel(nn.Module):
             src_encodings: Variable(batch_size, src_sent_len, hidden_size * 2)
             last_state, last_cell: Variable(batch_size, hidden_size)
         """
+        # Look up word embeddings for both, src words and types (e.g. "column", "table", etc.). After this we have the
+        # matrix: 64 (batchsize) * 22 (input tokens --> only the question words, not the columns) * 300 (embedding size)
         src_token_embed = self.gen_x_batch(src_sents_var)
 
         if q_onehot_project is not None:
             src_token_embed = torch.cat([src_token_embed, q_onehot_project], dim=-1)
-
+        # A pytorch util to easily fill a batch with sequences of different size.
         packed_src_token_embed = pack_padded_sequence(src_token_embed, src_sents_len, batch_first=True)
         # src_encodings: (tgt_query_len, batch_size, hidden_size)
+
+        # This is actually the NL-Encoder as in the paper: A multi-layer LSTM wich creates the source-embeddings H_x.
+        # Important: the output is one value per time step t, as well as the hidden state/cell state of the last cell.
         src_encodings, (last_state, last_cell) = self.encoder_lstm(packed_src_token_embed)
+        # the inverse operation for pack_padded_sequence above.
         src_encodings, _ = pad_packed_sequence(src_encodings, batch_first=True)
         # src_encodings: (batch_size, tgt_query_len, hidden_size)
         # src_encodings = src_encodings.permute(1, 0, 2)
         # (batch_size, hidden_size * 2)
+
+        # To my knowledge this concatenation is because we have two cell state (it's a bi-directional LSTM)
         last_state = torch.cat([last_state[0], last_state[1]], -1)
         last_cell = torch.cat([last_cell[0], last_cell[1]], -1)
 
@@ -131,6 +139,8 @@ class BasicModel(nn.Module):
                     elif ws_len == 1:
                         q_val.append(emb_list[0])
                     else:
+                        # there can be multiple tokens if the schema linking already found a type ("column", "table", "value") for a span (word). In that case,
+                        # we concat the embeddings and normalize them.
                         q_val.append(sum(emb_list) / float(ws_len))
 
             val_embs.append(q_val)

@@ -24,6 +24,9 @@ from src.rule.semQL import Sup, Sel, Order, Root, Filter, A, N, C, T, Root1
 
 wordnet_lemmatizer = WordNetLemmatizer()
 
+import nltk
+nltk.download('wordnet')
+
 
 def load_word_emb(file_name, use_small=False):
     print ('Loading word embedding from %s'%file_name)
@@ -175,6 +178,9 @@ def to_batch_seq(sql_data, table_data, idxes, st, ed,
 
     for i in range(st, ed):
         sql = sql_data[idxes[i]]
+
+        # The table data contains detailed information about that database. This includes tables, table headers (columns)
+        # and also foreign/primary keys.
         table = table_data[sql['db_id']]
 
         process_dict = process(sql, table)
@@ -247,7 +253,7 @@ def epoch_train(model, optimizer, batch_size, sql_data, table_data,
         loss_lf = torch.mean(loss_lf)
 
         if epoch > loss_epoch_threshold:
-            loss = loss_lf + sketch_loss_coefficient * loss_sketch
+            loss = loss_lf + sketch_loss_coefficient * loss_sketch  # after a while (20 epochs), we seem to down-weight the loss of the sketch to focus more on the lf-loss
         else:
             loss = loss_lf + loss_sketch
 
@@ -316,6 +322,12 @@ def load_data_new(sql_path, table_data, use_small=False):
     sql_data = []
 
     print("Loading data from %s" % sql_path)
+    # sql_data basically is what we see in the original spider-data: https://github.com/taoyds/spider.
+    # it is though already enriched with some information as e.g. POS (stanford_pos and nltk_pos) and NER (stanford_ner)
+    # The most complex field is the sql-dict, which contains the structured sql similar to the "sql" attribute in spider
+    # For more details on this structure see the example in https://github.com/taoyds/spider/blob/master/preprocess/parsed_sql_examples.sql
+
+
     with open(sql_path) as inf:
         data = lower_keys(json.load(inf))
         sql_data += data
@@ -336,6 +348,8 @@ def load_dataset(dataset_dir, use_small=False):
     DEV_PATH = os.path.join(dataset_dir, "dev.json")
     with open(TABLE_PATH) as inf:
         print("Loading data from %s"%TABLE_PATH)
+        # table_data is basically a dict with all the 200 (in train ca. 166) datasets of spider.
+        # Each sub-dict contains the name of all tables, as well as relations between them (foreign keys, primary keys)
         table_data = json.load(inf)
 
     train_sql_data, train_table_data = load_data_new(TRAIN_PATH, table_data, use_small=use_small)

@@ -24,7 +24,7 @@ from src.rule import semQL as define_rule
 
 
 class IRNet(BasicModel):
-    
+
     def __init__(self, args, grammar):
         super(IRNet, self).__init__()
         self.args = args
@@ -101,10 +101,11 @@ class IRNet(BasicModel):
         nn.init.xavier_normal_(self.type_embed.weight.data)
         nn.init.xavier_normal_(self.N_embed.weight.data)
         print('Use Column Pointer: ', True if self.use_column_pointer else False)
-        
+
     def forward(self, examples):
         args = self.args
         # now should implement the examples
+        # "grammar" is the SemQL language. It contains lookup tables (string to id <--> id to string)
         batch = Batch(examples, self.grammar, cuda=self.args.cuda)
 
         table_appear_mask = batch.table_appear_mask
@@ -114,7 +115,9 @@ class IRNet(BasicModel):
 
         src_encodings = self.dropout(src_encodings)
 
+        # Source encodings to create the sketch (the AST without the leaf-nodes)
         utterance_encodings_sketch_linear = self.att_sketch_linear(src_encodings)
+        # Source encodings to create the leaf-nodes
         utterance_encodings_lf_linear = self.att_lf_linear(src_encodings)
 
         dec_init_vec = self.init_decoder_state(last_cell)
@@ -126,10 +129,22 @@ class IRNet(BasicModel):
 
         sketch_attention_history = list()
 
+        ####################### PART 1: figuring out the sketch-action-loss ###########################################
         for t in range(batch.max_sketch_num):
+            # This is the case if it the first decoding step. We initialize the inputs with zero
+            # (while the last cell state is initialized from the last state of the decoder, see h_tm1).
+            # This makes sense if you think about it: into the RNN we only feed information from the previous step.
+            # In the first step we don't have this.
             if t == 0:
                 x = Variable(self.new_tensor(len(batch), self.sketch_decoder_lstm.input_size).zero_(),
                              requires_grad=False)
+            # if it is not the first step, we need to set together the information from the last step we wanna input
+            # to the LSTM. This is all based on the Chapter 2.3 in TranX (first equation of the decoder):
+            # the input is set together by the last action which is here the action embedding from
+            # the "production_embed" array. The second attentional vector ~s (which is here "att_tm1") and the parent
+            # feeding (the parent frontier field) p, which is here the "type_embed" embeddings.
+            # All this information together form the input ("x") for the next step.
+
             else:
                 a_tm1_embeds = []
                 pre_types = []
@@ -146,15 +161,15 @@ class IRNet(BasicModel):
                                                 define_rule.Sup,
                                                 define_rule.N,
                                                 define_rule.Order]:
-                            a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[action_tm1.production]]
+                            a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[action_tm1.production]] # The embedding of the last action.
                         else:
                             print(action_tm1, 'only for sketch')
-                            quit()
+                            quit() # The "example.sketch" should only contain sketch-actions (no leaf-actions). So if we reach this code it is an error scenario.
                             a_tm1_embed = zero_action_embed
                             pass
                     else:
-                        a_tm1_embed = zero_action_embed
-
+                        a_tm1_embed = zero_action_embed # add a "noop" action if this sample is shorter
+                    # get the embeddings for the last action for the whole batch. Use Zero-Embeddings if no action.
                     a_tm1_embeds.append(a_tm1_embed)
 
                 a_tm1_embeds = torch.stack(a_tm1_embeds)
@@ -172,6 +187,10 @@ class IRNet(BasicModel):
 
                 inputs.append(att_tm1)
                 inputs.append(pre_types)
+                # The "inputs"-array (and so "x") contains three elements, exactly as described in the TranX-Paper (Decoder-Equation):
+                # 1. ("a_tm1_embeds"): the action-embedding of the previous step
+                # 2. ("att_tm1"): the attentional vector ~s of the previous step
+                # 3. ("pre_types"): the parent feeding (see TranX-paper)
                 x = torch.cat(inputs, dim=-1)
 
             src_mask = batch.src_token_mask
@@ -180,46 +199,83 @@ class IRNet(BasicModel):
                                                  utterance_encodings_sketch_linear, self.sketch_decoder_lstm,
                                                  self.sketch_att_vec_linear,
                                                  src_token_mask=src_mask, return_att_weight=True)
+
+            # This doesn't really seem to have an effect...
             sketch_attention_history.append(att_t)
 
             # get the Root possibility
+            # Ursin: What do we afterwards have in apply_rule_prob? We have a vector size (batch * 46) with
+            # probabilities. 46 is the amount of possible actions (see self.grammar.prod2id).
+            # So we have a softmax over all possible actions for each example in the batch.
+            # self.production_readout is kind of a transformation of the attention. Not sure how important.
             apply_rule_prob = F.softmax(self.production_readout(att_t), dim=-1)
 
+            # iterate over the batch.
             for e_id, example in enumerate(examples):
+                # t is the current step in the whole "batch.max_sketch_num" loop. So it seems we only add more actions
+                # if the  current example is not smaller than this step ---> that way we can handle the whole batch and
+                # just stop doing it for the small trees.
                 if t < len(example.sketch):
                     action_t = example.sketch[t]
+                    # We take the ground-truth action (action_t) and get the predicted probability for this action from
+                    # the action-probability vector "apply_rule_prob". Be aware, e_id is only the current example.
                     act_prob_t_i = apply_rule_prob[e_id, self.grammar.prod2id[action_t.production]]
+                    # in "action_probs" we store the sequence of prediction actions (for each example)
                     action_probs[e_id].append(act_prob_t_i)
 
             h_tm1 = (h_t, cell_t)
             att_tm1 = att_t
 
+        # Note: the following line is quite important. It is basically the first part of the return-value of this function,
+        # which is the sketch-loss. With the log()-function we find out, how large the log is (remember: if probability = 1.0, log(1.0) = 0 --> no loss)
+        # we then simply sum the loss up for all sketch-actions in an example, so we have a simple array of 64 (batch size) sketch losses.
+        # Technically:
+        # we do a sum(log()) over all action-probabilities of a sample (the loop is only to get over all samples of a batch).
         sketch_prob_var = torch.stack(
             [torch.stack(action_probs_i, dim=0).log().sum() for action_probs_i in action_probs], dim=0)
 
+        ####################### PART 2: Create Schema (Column & Table) Embeddings ###########################################
+        # What we see here in the next few lines is actually the schema encoder as described in IRNet
+        # 2.3 "Schema Encoder".
+
+        # Look up word embeddings for the columns of each sample. "table_sents" contains the columns,
+        # splitted by word, for this sample.
         table_embedding = self.gen_x_batch(batch.table_sents)
+        # encode the source, so the question tokens, again (exactly the same as in "BasicModel.encode()")
         src_embedding = self.gen_x_batch(batch.src_sents)
+        # encode the table names.
         schema_embedding = self.gen_x_batch(batch.table_names)
 
         # get emb differ
+        # "embedding_cosine" calculates the cosine similarity between the source embeddings and the column embeddings.
+        # This follows the first Equation (g_k_i) in the "Schema Encoder", chapter 2.3
         embedding_differ = self.embedding_cosine(src_embedding=src_embedding, table_embedding=table_embedding,
                                                  table_unk_mask=batch.table_unk_mask)
 
+        # and the same again for the tables
         schema_differ = self.embedding_cosine(src_embedding=src_embedding, table_embedding=schema_embedding,
                                               table_unk_mask=batch.schema_token_mask)
 
+        # source_encodings * column_difference = attention. This is the second equation (the sum) in Chapter 2.3
         tab_ctx = (src_encodings.unsqueeze(1) * embedding_differ.unsqueeze(3)).sum(2)
+
+        # and the same again with the tables. Be aware that we also sum up over the 3rd dimension, which is the number
+        # over words in the source encodings. So we still have one value per Column, but this is the attention over the
+        # question (so all words)
         schema_ctx = (src_encodings.unsqueeze(1) * schema_differ.unsqueeze(3)).sum(2)
 
-
+        # Then we concat the initial embedding (so the average embedding over the column words) and the context vector,
+        # as seen in the third equation of the schema encoder.
         table_embedding = table_embedding + tab_ctx
 
         schema_embedding = schema_embedding + schema_ctx
 
         col_type = self.input_type(batch.col_hot_type)
 
+        # we create a linear layer around the col_type tensor. What is the reason for this? To learn something here as well?
         col_type_var = self.col_type(col_type)
 
+        # We then also add an additional vector for the column type (the "phi" in the third equation of the schema encoder)
         table_embedding = table_embedding + col_type_var
 
         batch_table_dict = batch.col_table_dict
@@ -228,6 +284,11 @@ class IRNet(BasicModel):
 
         h_tm1 = dec_init_vec
 
+        ####################### PART 3: figuring out the leaf-action ###########################################
+
+        # important to understand: while we here still work with all actions (remember, the t-1 action can be anything!), we
+        # are in the end only interested in the actions creating a Leaf-Node (so A, C and T). We therefore also work with "example.tgt_actions" and not with "example.sketch" as above.
+        # in the end, when creating the loss, we only have a look at this three action types.
         for t in range(batch.max_action_num):
             if t == 0:
                 # x = self.lf_begin_vec.unsqueeze(0).repeat(len(batch), 1)
@@ -239,6 +300,7 @@ class IRNet(BasicModel):
                 for e_id, example in enumerate(examples):
                     if t < len(example.tgt_actions):
                         action_tm1 = example.tgt_actions[t - 1]
+                        # We still need all the "Sketch-Action" types as they could be the t-1 action, before creating a leaf-node.
                         if type(action_tm1) in [define_rule.Root1,
                                                 define_rule.Root,
                                                 define_rule.Sel,
@@ -249,12 +311,15 @@ class IRNet(BasicModel):
                                                 ]:
 
                             a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[action_tm1.production]]
-
+                        # This section is the big difference to the almost similar block above: We now also consider production actions which are "leaf" nodes in the AST.
                         else:
+                            # rule C is a leaf-node: choosing a column embedding. Not a 100% sure why we need trainable weights ("column_rnn_input" is just a linear layer with the embedding as input here)
                             if isinstance(action_tm1, define_rule.C):
                                 a_tm1_embed = self.column_rnn_input(table_embedding[e_id, action_tm1.id_c])
+                            # rule T is a leaf-node: choosing a table embedding
                             elif isinstance(action_tm1, define_rule.T):
                                 a_tm1_embed = self.column_rnn_input(schema_embedding[e_id, action_tm1.id_c])
+                            # Rule A is more similar to the rules above: here we produce just a production embedding
                             elif isinstance(action_tm1, define_rule.A):
                                 a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[action_tm1.production]]
                             else:
@@ -271,6 +336,7 @@ class IRNet(BasicModel):
 
                 inputs = [a_tm1_embeds]
 
+                # very similar to the part above, but we consider here the "tgt_actions" to create the parent-feeding.
                 # tgt t-1 action type
                 for e_id, example in enumerate(examples):
                     if t < len(example.tgt_actions):
@@ -290,28 +356,39 @@ class IRNet(BasicModel):
 
             src_mask = batch.src_token_mask
 
+            # we use a second RNN to predict the next actions for the leaf-nodes. Everything else stays the same as above
             (h_t, cell_t), att_t, aw = self.step(x, h_tm1, src_encodings,
                                                  utterance_encodings_lf_linear, self.lf_decoder_lstm,
                                                  self.lf_att_vec_linear,
                                                  src_token_mask=src_mask, return_att_weight=True)
 
+            # Here we do the same as above, we get the action probabilites by doing a softmax over all actions.
             apply_rule_prob = F.softmax(self.production_readout(att_t), dim=-1)
+
+            ####################### PART 4: Selecting the right column/table ###########################################
+            # Now from there the code is different then in the sketch-action-case: the leaf action, in contrary to the sketch action,
+            # need in addition to the action also to select a column (if action C) or a table (if action T). So we use
+            # a pointer-net (which is a simplified attention mechanism, just pointing at some source-elements) to select the right one.
             table_appear_mask_val = torch.from_numpy(table_appear_mask)
             if self.cuda:
                 table_appear_mask_val = table_appear_mask_val.cuda()
 
-            if self.use_column_pointer:
+            if self.use_column_pointer: # by default this is "False".
                 gate = F.sigmoid(self.prob_att(att_t))
                 weights = self.column_pointer_net(src_encodings=table_embedding, query_vec=att_t.unsqueeze(0),
                                                   src_token_mask=None) * table_appear_mask_val * gate + self.column_pointer_net(
                     src_encodings=table_embedding, query_vec=att_t.unsqueeze(0),
                     src_token_mask=None) * (1 - table_appear_mask_val) * (1 - gate)
             else:
+                # remember: a pointer network basically just selecting a column from "table_embedding". It is a simplified attention mechanism
                 weights = self.column_pointer_net(src_encodings=table_embedding, query_vec=att_t.unsqueeze(0),
                                                   src_token_mask=batch.table_token_mask)
-
+            # The mask is necessary to mask out the question-tokens, as we are only interested in pointer to the columns!
+            # the "masked_fill_" function fills every position with a "True", which is the last N-rows, where the question tokens are,
+            # with the given value (minus infinity). So the remaining columns (the M in the beginning) is the columns.
             weights.data.masked_fill_(batch.table_token_mask.bool(), -float('inf'))
 
+            # get the probabilities for the selected column.
             column_attention_weights = F.softmax(weights, dim=-1)
 
             table_weights = self.table_pointer_net(src_encodings=schema_embedding, query_vec=att_t.unsqueeze(0),
@@ -329,7 +406,7 @@ class IRNet(BasicModel):
                 if t < len(example.tgt_actions):
                     action_t = example.tgt_actions[t]
                     if isinstance(action_t, define_rule.C):
-                        table_appear_mask[e_id, action_t.id_c] = 1
+                        table_appear_mask[e_id, action_t.id_c] = 1  # this seems only important in case the self.use_column_pointer flag is activated
                         table_enable[e_id] = action_t.id_c
                         act_prob_t_i = column_attention_weights[e_id, action_t.id_c]
                         action_probs[e_id].append(act_prob_t_i)
@@ -343,14 +420,18 @@ class IRNet(BasicModel):
                         pass
             h_tm1 = (h_t, cell_t)
             att_tm1 = att_t
+
+        # same as above for sketch_prob_var: we sum up the loss per sample.
         lf_prob_var = torch.stack(
             [torch.stack(action_probs_i, dim=0).log().sum() for action_probs_i in action_probs], dim=0)
 
         return [sketch_prob_var, lf_prob_var]
 
+    # TODO: Analyze this! It's how we really do predictions.
     def parse(self, examples, beam_size=5):
         """
         one example a time
+        Ursin: this method does the prediction. With help of beam-search
         :param examples:
         :param beam_size:
         :return:
@@ -744,10 +825,14 @@ class IRNet(BasicModel):
         # h_t: (batch_size, hidden_size)
         h_t, cell_t = decoder(x, h_tm1)
 
+        # calculate attention. See "dot_prod_attention" for more details.
         ctx_t, alpha_t = nn_utils.dot_prod_attention(h_t,
                                                      src_encodings, src_encodings_att_linear,
                                                      mask=src_token_mask)
 
+        # we concat the hidden state and the context vector as input. Forget about the attention_function.
+        # This is exactly as the described in TranX, 2.3 (equation with tanh)
+        # this is just a linear function
         att_t = F.tanh(attention_func(torch.cat([h_t, ctx_t], 1)))
         att_t = self.dropout(att_t)
 
